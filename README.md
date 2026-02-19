@@ -1,3 +1,5 @@
+![Verification screenshot](screenshot.png)
+
 # VATA Demo Epoch 0001 (Reproducible)
 
 This folder contains a frozen forensic epoch.
