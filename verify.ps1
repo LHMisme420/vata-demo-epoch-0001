@@ -1,23 +1,14 @@
-
 Write-Host "`n=== VATA DEMO EPOCH VERIFIER ===`n"
 
 # ------------------------
-# CONFIG
+# CONFIG (OP SEPOLIA)
 # ------------------------
 $ANCHOR_CONTRACT = "0x8c6624d4AfF1C8D0E317B40699c2B4933A2c8CfF"
+$RPC_URL = "https://sepolia.optimism.io"
 
-# Try likely chains. Keep only ones where `cast code` returns non-0x.
-$RPCS = @(
-  "https://ethereum-rpc.publicnode.com",   # Ethereum mainnet
-  "https://sepolia.optimism.io"           # OP Sepolia
-)
-
-$EVENT_SIG = "ProofAnchored(bytes32,address)"
-
-# scan controls
+# Scan controls (used only if you later add event scanning)
 $MAX_SCAN = 2000000
-     # increase if needed (e.g. 2000000)
-$CHUNK    = 10000      # provider-safe chunk size
+$CHUNK    = 10000
 
 # ------------------------
 # FILE CHECKS
@@ -37,68 +28,95 @@ if ($receiptHash -ne $root) {
   Write-Host "`nROOT MISMATCH" -ForegroundColor Red
   exit 1
 }
-
 Write-Host "`nROOT OK" -ForegroundColor Green
 
+# Convert root (bytes32 hex) to uint256 decimal for tx-arg comparison
+Add-Type -AssemblyName System.Numerics
+$rootU = [System.Numerics.BigInteger]::Parse("0" + $root.Substring(2), [System.Globalization.NumberStyles]::AllowHexSpecifier).ToString()
+
 # ------------------------
-# ONCHAIN CHECK (EVENT SCAN)
+# ONCHAIN CHECK (TX-INPUT BASED)
 # ------------------------
-Write-Host "`n[INFO] Onchain check (logs): contract=$ANCHOR_CONTRACT"
-$onchainFound = $false
-$foundRpc = $null
-$foundLogs = $null
+Write-Host "`n[INFO] Onchain check (OP Sepolia): contract=$ANCHOR_CONTRACT"
+Write-Host "[INFO] RPC: $RPC_URL"
 
-foreach ($rpcUrl in $RPCS) {
-
-  Write-Host "`n[INFO] Trying RPC: $rpcUrl"
-
-  # Ensure contract exists on this chain
-  $code = cast code $ANCHOR_CONTRACT --rpc-url $rpcUrl
-  if (!$code -or $code -eq "0x") {
-    Write-Host "[WARN] No code at this address on this RPC. Skipping." -ForegroundColor Yellow
-    continue
-  }
-
-  $latest = [int](cast block-number --rpc-url $rpcUrl)
-  $minBlock = $latest - $MAX_SCAN
-  if ($minBlock -lt 0) { $minBlock = 0 }
-
-  for ($toBlock = $latest; $toBlock -ge $minBlock; $toBlock -= $CHUNK) {
-
-    $fromBlock = $toBlock - ($CHUNK - 1)
-    if ($fromBlock -lt $minBlock) { $fromBlock = $minBlock }
-
-    Write-Host "[INFO] Scanning blocks $fromBlock .. $toBlock"
-
-    # cast logs syntax for your version:
-    # cast logs ... [SIG_OR_TOPIC] [TOPICS...]
-    $logs = cast logs `
-      --rpc-url $rpcUrl `
-      --address $ANCHOR_CONTRACT `
-      --from-block $fromBlock `
-      --to-block $toBlock `
-      "$EVENT_SIG" `
-      $root
-
-    if ($logs -and $logs.Trim().Length -gt 0) {
-      $onchainFound = $true
-      $foundRpc = $rpcUrl
-      $foundLogs = $logs
-      break
-    }
-  }
-
-  if ($onchainFound) { break }
+# Ensure contract exists on OP Sepolia
+$code = cast code $ANCHOR_CONTRACT --rpc-url $RPC_URL
+if (!$code -or $code -eq "0x") {
+  Write-Host "`nERROR: No code at $ANCHOR_CONTRACT on OP Sepolia." -ForegroundColor Red
+  Write-Host "`nVerification complete.`n"
+  exit 1
 }
 
-if ($onchainFound) {
+if (!(Test-Path ".\anchor_tx.txt")) {
+  Write-Host "`nWARN: anchor_tx.txt not found. Cannot do tx-based onchain verification." -ForegroundColor Yellow
+  Write-Host "      Anchor this root and write the tx hash to anchor_tx.txt, then rerun." -ForegroundColor Yellow
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+$txText = (Get-Content ".\anchor_tx.txt" -Raw).Trim()
+if (!($txText -match "(0x[a-fA-F0-9]{64})")) {
+  Write-Host "`nWARN: anchor_tx.txt exists but no tx hash found inside." -ForegroundColor Yellow
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+$txHash = $matches[1].ToLower()
+Write-Host "`n[INFO] anchor tx: $txHash"
+
+$tx = cast tx $txHash --rpc-url $RPC_URL
+if (!$tx -or $tx.Trim().Length -eq 0) {
+  Write-Host "`nWARN: tx not found on OP Sepolia: $txHash" -ForegroundColor Yellow
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+# Extract tx "to" and "input"
+$toLine = ($tx -split "`n" | Where-Object { $_ -match "^\s*to\s+" } | Select-Object -First 1)
+$inLine = ($tx -split "`n" | Where-Object { $_ -match "^\s*input\s+" } | Select-Object -First 1)
+
+if (!$toLine -or !$inLine) {
+  Write-Host "`nWARN: Could not parse tx fields (to/input)." -ForegroundColor Yellow
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+# Parse "to"
+$toAddr = ($toLine -replace "^\s*to\s+","").Trim().ToLower()
+
+if ($toAddr -ne $ANCHOR_CONTRACT.ToLower()) {
+  Write-Host "`nWARN: Tx 'to' does not match anchor contract." -ForegroundColor Yellow
+  Write-Host "      tx.to:    $toAddr"
+  Write-Host "      expected: $($ANCHOR_CONTRACT.ToLower())"
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+# Parse "input" (hex calldata)
+$input = ($inLine -replace "^\s*input\s+","").Trim().ToLower()
+
+# Decode as function selector + 32-byte arg (anchorRoot(uint256))
+# selector: 4 bytes = 8 hex chars after 0x
+# arg: next 32 bytes = 64 hex chars
+if (!($input -match "^0x[0-9a-f]{8}[0-9a-f]{64}")) {
+  Write-Host "`nWARN: Tx input does not look like selector + single uint256 arg." -ForegroundColor Yellow
+  Write-Host "      input: $input"
+  Write-Host "`nVerification complete.`n"
+  exit 0
+}
+
+$argHex = "0x" + $input.Substring(10, 64)  # skip 0x + 8 selector chars = 10
+$argU = [System.Numerics.BigInteger]::Parse("0" + $argHex.Substring(2), [System.Globalization.NumberStyles]::AllowHexSpecifier).ToString()
+
+if ($argU -eq $rootU) {
   Write-Host "`nONCHAIN OK" -ForegroundColor Green
-  Write-Host "[INFO] Found on: $foundRpc"
-  $snippet = ($foundLogs -split "`n" | Select-Object -First 40) -join "`n"
-  Write-Host $snippet
+  Write-Host "[INFO] Tx input arg matches root."
+  Write-Host "[INFO] tx=$txHash"
 } else {
-  Write-Host "`nWARN: Did NOT find root within last ~$MAX_SCAN blocks on configured RPCs." -ForegroundColor Yellow
-  Write-Host "      If it was anchored earlier, increase `$MAX_SCAN." -ForegroundColor Yellow
+  Write-Host "`nWARN: Tx input arg does NOT match root." -ForegroundColor Yellow
+  Write-Host "      tx arg (uint256): $argU"
+  Write-Host "      root   (uint256): $rootU"
 }
 
 Write-Host "`nVerification complete.`n"
