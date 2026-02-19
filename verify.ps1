@@ -4,42 +4,31 @@ Write-Host "`n=== VATA DEMO EPOCH VERIFIER ===`n"
 # ------------------------
 # CONFIG
 # ------------------------
-
-# Anchor contract (from your earlier $OP_REG)
 $ANCHOR_CONTRACT = "0x8c6624d4AfF1C8D0E317B40699c2B4933A2c8CfF"
 
-# RPCs to try (add/remove as needed)
+# Try likely chains. Keep only ones where `cast code` returns non-0x.
 $RPCS = @(
-  "https://ethereum-rpc.publicnode.com",          # Ethereum mainnet
-  "https://ethereum-sepolia-rpc.publicnode.com",  # Sepolia
-  "https://sepolia.optimism.io",                  # OP Sepolia
-  "https://mainnet.optimism.io"                   # OP Mainnet
+  "https://ethereum-rpc.publicnode.com",   # Ethereum mainnet
+  "https://sepolia.optimism.io"           # OP Sepolia
 )
 
-# How far back to scan (blocks)
-$MAX_SCAN = 2000000
-
-
-# Scan chunk size (keep <= provider limits; 10k is usually safe)
-$CHUNK = 10000
-
-# Event signature (commitment is indexed in your ABI snippet)
 $EVENT_SIG = "ProofAnchored(bytes32,address)"
+
+# scan controls
+$MAX_SCAN = 2000000
+     # increase if needed (e.g. 2000000)
+$CHUNK    = 10000      # provider-safe chunk size
 
 # ------------------------
 # FILE CHECKS
 # ------------------------
-
 if (!(Test-Path ".\receipt.json")) { Write-Host "ERROR: receipt.json not found" -ForegroundColor Red; exit 1 }
 if (!(Test-Path ".\merkle_root_v2.txt")) { Write-Host "ERROR: merkle_root_v2.txt not found" -ForegroundColor Red; exit 1 }
 
-$rootFileRaw = (Get-Content ".\merkle_root_v2.txt" -Raw).Trim()
+$rootFileRaw = (Get-Content ".\merkle_root_v2.txt" -Raw).Trim().ToLower()
+$root = if ($rootFileRaw.StartsWith("0x")) { $rootFileRaw } else { "0x$rootFileRaw" }
 
-# Normalize root to 0x-prefixed lowercase 64-hex
-$root = $rootFileRaw.ToLower()
-if ($root.StartsWith("0x")) { $root = $root } else { $root = "0x$root" }
-
-$receiptHash = ("0x" + (Get-FileHash ".\receipt.json" -Algorithm SHA256).Hash.ToLower())
+$receiptHash = "0x" + (Get-FileHash ".\receipt.json" -Algorithm SHA256).Hash.ToLower()
 
 Write-Host "Computed SHA256(receipt.json): $receiptHash"
 Write-Host "Root from file:               $root"
@@ -52,59 +41,49 @@ if ($receiptHash -ne $root) {
 Write-Host "`nROOT OK" -ForegroundColor Green
 
 # ------------------------
-# ONCHAIN CHECK
+# ONCHAIN CHECK (EVENT SCAN)
 # ------------------------
-
 Write-Host "`n[INFO] Onchain check (logs): contract=$ANCHOR_CONTRACT"
-$topic0 = cast keccak "$EVENT_SIG"
-
 $onchainFound = $false
 $foundRpc = $null
-$foundLine = $null
+$foundLogs = $null
 
-foreach ($rpc in $RPCS) {
+foreach ($rpcUrl in $RPCS) {
 
-  Write-Host "`n[INFO] Trying RPC: $rpc"
+  Write-Host "`n[INFO] Trying RPC: $rpcUrl"
 
-  # 1) Ensure contract exists on this chain
-  $code = cast code $ANCHOR_CONTRACT --rpc-url $rpc
+  # Ensure contract exists on this chain
+  $code = cast code $ANCHOR_CONTRACT --rpc-url $rpcUrl
   if (!$code -or $code -eq "0x") {
     Write-Host "[WARN] No code at this address on this RPC. Skipping." -ForegroundColor Yellow
     continue
   }
 
-  # 2) Get latest block
-  $latestStr = cast block-number --rpc-url $rpc
-  if (-not $latestStr) {
-    Write-Host "[WARN] Could not fetch block number. Skipping." -ForegroundColor Yellow
-    continue
-  }
-  $latest = [int]$latestStr
+  $latest = [int](cast block-number --rpc-url $rpcUrl)
+  $minBlock = $latest - $MAX_SCAN
+  if ($minBlock -lt 0) { $minBlock = 0 }
 
-  $fromLimit = $latest - $MAX_SCAN
-  if ($fromLimit -lt 0) { $fromLimit = 0 }
+  for ($toBlock = $latest; $toBlock -ge $minBlock; $toBlock -= $CHUNK) {
 
-  # 3) Scan backwards in chunks using TOPIC FILTERING (fast and exact)
-  for ($to = $latest; $to -ge $fromLimit; $to -= $CHUNK) {
+    $fromBlock = $toBlock - ($CHUNK - 1)
+    if ($fromBlock -lt $minBlock) { $fromBlock = $minBlock }
 
-    $from = $to - ($CHUNK - 1)
-    if ($from -lt $fromLimit) { $from = $fromLimit }
+    Write-Host "[INFO] Scanning blocks $fromBlock .. $toBlock"
 
-    Write-Host "[INFO] Scanning blocks $from .. $to"
+    # cast logs syntax for your version:
+    # cast logs ... [SIG_OR_TOPIC] [TOPICS...]
     $logs = cast logs `
-      --rpc-url $rpc `
+      --rpc-url $rpcUrl `
       --address $ANCHOR_CONTRACT `
-      --from-block $from `
-      --to-block $to `
+      --from-block $fromBlock `
+      --to-block $toBlock `
       "$EVENT_SIG" `
       $root
 
-   
-
-    if ($logs -and ($logs -match "transactionHash|txHash|blockNumber|logIndex|topics")) {
+    if ($logs -and $logs.Trim().Length -gt 0) {
       $onchainFound = $true
-      $foundRpc = $rpc
-      $foundLine = $logs
+      $foundRpc = $rpcUrl
+      $foundLogs = $logs
       break
     }
   }
@@ -115,12 +94,11 @@ foreach ($rpc in $RPCS) {
 if ($onchainFound) {
   Write-Host "`nONCHAIN OK" -ForegroundColor Green
   Write-Host "[INFO] Found on: $foundRpc"
-  # Print a small snippet so it's screenshot-friendly
-  $snippet = ($foundLine -split "`n" | Select-Object -First 30) -join "`n"
+  $snippet = ($foundLogs -split "`n" | Select-Object -First 40) -join "`n"
   Write-Host $snippet
 } else {
-  Write-Host "`nWARN: Did NOT find root within last ~$MAX_SCAN blocks on any configured RPC." -ForegroundColor Yellow
-  Write-Host "      If it was anchored earlier, increase `$MAX_SCAN or add the correct RPC." -ForegroundColor Yellow
+  Write-Host "`nWARN: Did NOT find root within last ~$MAX_SCAN blocks on configured RPCs." -ForegroundColor Yellow
+  Write-Host "      If it was anchored earlier, increase `$MAX_SCAN." -ForegroundColor Yellow
 }
 
 Write-Host "`nVerification complete.`n"
