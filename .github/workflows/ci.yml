@@ -13,7 +13,7 @@ jobs:
       - name: Run local verifier (should say ROOT OK)
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1 -LocalOnly
 
       - name: Run tamper test (should PASS)
         shell: pwsh
