@@ -1,4 +1,4 @@
-![Verification screenshot](screenshot.png)
+
 
 # VATA Demo Epoch 0001 (Reproducible)
 
